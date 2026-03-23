@@ -45,10 +45,10 @@ NX, NY = 62, 126             # 광진구 기상청 격자
 STATION_NAME = "광진구"       # 에어코리아 측정소
 
 DISPLAY_REFRESH_SEC = 3
-API_REFRESH_SEC = 15           # 캘린더 이벤트 갱신 주기
-WEATHER_REFRESH_SEC = 120      # 날씨/미세먼지 갱신 주기 (2분)
-TOAST_DURATION_SEC = 10
-TOAST_CHECK_SEC = 300          # 5분마다 이메일 체크
+API_REFRESH_SEC = 5            # 캘린더 이벤트 갱신 주기
+WEATHER_REFRESH_SEC = 900      # 날씨/미세먼지 갱신 주기 (15분)
+TOAST_DURATION_SEC = 60
+TOAST_CHECK_SEC = 60           # 1분마다 이메일 체크
 
 # Colors
 C_DARK1 = (26, 26, 46)
@@ -72,10 +72,12 @@ HOUR_START = 8
 HOUR_END = 24
 
 # Toast
-TOAST_H = 140
+TOAST_H = 100
 TOAST_PAD = 8
 TOAST_MAX = 3
-TOAST_MARGIN = 14
+TOAST_MARGIN = 24
+TOAST_AREA_H = 500             # 토스트 partial update 영역 높이
+TOAST_AREA_Y = SCREEN_HEIGHT - TOAST_AREA_H  # 1420
 
 # ─── Resource Helpers ─────────────────────────────────────────────────────
 
@@ -323,59 +325,81 @@ def fetch_emails():
 # ─── Toast Manager ────────────────────────────────────────────────────────
 
 class ToastManager:
-    """새 메일 → 1회 슬라이드업 → 10초 유지 → 완전 퇴장. 5분 간격 체크."""
+    """안 읽은 메일 → 슬라이드업 → 유지(60s) → 슬라이드아웃. ease-out 곡선."""
+
+    ANIM_SEC = 3.0               # 애니메이션 총 3초
+    MAX_OFFSET = 500             # 최대 오프셋 (화면 밖)
 
     def __init__(self):
         self.active = []
-        self.phase = "none"    # none → in → show → out → done
-        self.tick_n = 0
+        self.phase = "none"      # none → in → show → out → done
         self.phase_start = 0
-        self._shown_ids = set()
 
     def update(self, emails):
-        new = [e for e in emails if e["id"] not in self._shown_ids]
-        if new:
-            self.active = new[:TOAST_MAX]
-            self.phase = "in"
-            self.tick_n = 0
-            for e in new:
-                self._shown_ids.add(e["id"])
-        if len(self._shown_ids) > 100:
-            self._shown_ids = set(list(self._shown_ids)[-50:])
-
-    def tick(self):
-        if self.phase in ("none", "done"):
-            return [], 0
-
-        if self.phase == "in":
-            steps = [200, 60, 0]
-            off = steps[min(self.tick_n, 2)]
-            self.tick_n += 1
-            if self.tick_n >= 3:
-                self.phase = "show"
+        if emails:
+            self.active = emails[:TOAST_MAX]
+            if not self.is_active:
+                self.phase = "in"
                 self.phase_start = time.time()
-            return self.active, off
-
-        if self.phase == "show":
-            if time.time() - self.phase_start >= TOAST_DURATION_SEC:
+                print(f"[Toast] slide-in {len(emails)} emails")
+        else:
+            if self.phase in ("in", "show"):
                 self.phase = "out"
-                self.tick_n = 0
-            return self.active, 0
+                self.phase_start = time.time()
+                print("[Toast] slide-out (all read)")
 
-        if self.phase == "out":
-            steps = [30, 100, 250]
-            off = steps[min(self.tick_n, 2)]
-            self.tick_n += 1
-            if self.tick_n >= 3:
-                self.phase = "done"
-                self.active = []
-            return self.active, off
-
-        return [], 0
+    @property
+    def is_active(self):
+        return self.phase not in ("none", "done")
 
     @property
     def animating(self):
         return self.phase in ("in", "out")
+
+    @property
+    def needs_body_refresh(self):
+        """body partial에 토스트를 포함해서 갱신이 필요한 타이밍."""
+        if not self.is_active:
+            return False
+        if self.animating:
+            return True
+        return False
+
+    def tick(self):
+        if not self.is_active:
+            return [], 0
+
+        now = time.time()
+        elapsed = now - self.phase_start
+
+        if self.phase == "in":
+            # ease-out: offset = MAX * (1 - t/dur)^2
+            t = min(elapsed / self.ANIM_SEC, 1.0)
+            offset = int(self.MAX_OFFSET * (1 - t) ** 2)
+            if t >= 1.0:
+                self.phase = "show"
+                self.phase_start = now
+                offset = 0
+            return self.active, offset
+
+        if self.phase == "show":
+            if elapsed >= TOAST_DURATION_SEC:
+                self.phase = "out"
+                self.phase_start = now
+                print("[Toast] duration expired, slide-out")
+            return self.active, 0
+
+        if self.phase == "out":
+            # ease-in: offset = MAX * (t/dur)^2
+            t = min(elapsed / self.ANIM_SEC, 1.0)
+            offset = int(self.MAX_OFFSET * t ** 2)
+            if t >= 1.0:
+                self.phase = "done"
+                self.active = []
+                print("[Toast] done")
+            return self.active, offset
+
+        return [], 0
 
 # ─── Renderer ─────────────────────────────────────────────────────────────
 
@@ -644,13 +668,16 @@ def render(weather, air, allday, timed, toasts, toast_off):
             lb = "자정"
         else:
             lb = f"PM {h-12}시"
-        d.text((3, hy - 10), lb, font=font(18), fill=C_HOUR)
+        d.text((8, hy - 10), lb, font=font(18), fill=C_HOUR)
         d.line([(75, hy), (SCREEN_WIDTH - 8, hy)], fill=C_LINE, width=1)
 
     # Timed events
     for ev in timed:
         sh = ev["start"].hour + ev["start"].minute / 60
         eh = ev["end"].hour + ev["end"].minute / 60
+        # 자정(0시) 종료 = 다음날 → 24시로 처리
+        if eh <= sh:
+            eh = 24
         if eh <= HOUR_START or sh >= HOUR_END:
             continue
         sh = max(sh, HOUR_START)
@@ -686,46 +713,100 @@ def render(weather, air, allday, timed, toasts, toast_off):
         d.text((EVT_TEXT_X, y2 - 28), ev["time_str"],
                font=EVT_TIME_FONT, fill=C_GRAY_TEXT)
 
-    # NOW line
+    # NOW line — 레드 글래스모피즘
     nh = n.hour + n.minute / 60
     if HOUR_START <= nh <= HOUR_END:
         ny = tl_top + (nh - HOUR_START) * hh
-        d.line([(3, ny), (SCREEN_WIDTH - 5, ny)], fill=C_NOW_RED, width=3)
-        d.ellipse([68, ny - 6, 82, ny + 6], fill=C_NOW_RED)
+        bar_h = 10
+        bar_y1 = int(ny - bar_h / 2)
+        bar_y2 = bar_y1 + bar_h
+        tri_w = 25
 
-    # ── Toast: 글래스모피즘 흰색 ─────────────────────────────────────
+        img = img.convert("RGBA")
+        # 배경 블러
+        bar_region = img.crop((0, max(0, bar_y1), SCREEN_WIDTH, min(SCREEN_HEIGHT, bar_y2)))
+        blurred = bar_region.filter(ImageFilter.GaussianBlur(12))
+        img.paste(blurred, (0, max(0, bar_y1)))
+
+        now_overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        nd = ImageDraw.Draw(now_overlay)
+        # 반투명 레드 바 (x=0부터, 삼각형과 겹침, 20% 더 투명)
+        nd.rectangle([(0, bar_y1), (SCREEN_WIDTH - 5, bar_y2)],
+                      fill=(220, 40, 40, 112))
+        # 좌측 삼각형 ▶ (바 위에 겹침, 25px)
+        tri_cy = int(ny)
+        tri_h = 13
+        nd.polygon([(0, tri_cy - tri_h), (tri_w, tri_cy), (0, tri_cy + tri_h)],
+                    fill=(220, 40, 40, 180))
+        img = Image.alpha_composite(img, now_overlay)
+        img = img.convert("RGB")
+        d = ImageDraw.Draw(img)
+
+    # ── Toast: 글래스모피즘 ─────────────────────────────────────────
     if toasts:
         img = img.convert("RGBA")
+        TX1, TX2 = 28, SCREEN_WIDTH - 28   # 좌우 28px 마진 (10px 확장)
+        TRAD = 28                           # 라운드 반경
 
         for i, em in enumerate(toasts):
             ty = SCREEN_HEIGHT - TOAST_MARGIN - (i + 1) * (TOAST_H + TOAST_PAD) + toast_off
             if ty > SCREEN_HEIGHT or ty + TOAST_H < 0:
                 continue
 
-            x1, y1t, x2, y2t = 8, max(0, ty), SCREEN_WIDTH - 8, min(SCREEN_HEIGHT, ty + TOAST_H)
-            if y2t > y1t:
-                region = img.crop((x1, y1t, x2, y2t))
-                blurred = region.filter(ImageFilter.GaussianBlur(18))
-                img.paste(blurred, (x1, y1t))
+            # 배경 블러 — 라운드 마스크로 클리핑하여 모서리 아티팩트 제거
+            cx1, cy1 = TX1, max(0, ty)
+            cx2, cy2 = TX2, min(SCREEN_HEIGHT, ty + TOAST_H)
+            if cy2 > cy1:
+                region = img.crop((cx1, cy1, cx2, cy2))
+                blurred = region.filter(ImageFilter.GaussianBlur(30))
+                # 라운드 마스크 생성
+                mask = Image.new("L", (cx2 - cx1, cy2 - cy1), 0)
+                md = ImageDraw.Draw(mask)
+                ry1 = max(0, ty) - ty
+                ry2 = min(SCREEN_HEIGHT, ty + TOAST_H) - ty
+                md.rounded_rectangle(
+                    [(0, ry1), (cx2 - cx1, ry2)],
+                    radius=TRAD, fill=255)
+                img.paste(blurred, (cx1, cy1), mask)
 
+            # 글래스 레이어: fill + 스트로크 + 좌측 그라데이션 쉐도우
             overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             od = ImageDraw.Draw(overlay)
+            # 반투명 배경 (알파 70 — 블러 충분히 비침)
             od.rounded_rectangle(
-                [(8, ty), (SCREEN_WIDTH - 8, ty + TOAST_H)],
-                radius=16, fill=(255, 255, 255, 195))
+                [(TX1, ty), (TX2, ty + TOAST_H)],
+                radius=TRAD, fill=(255, 255, 255, 70))
+            # 외곽 스트로크: 유리 느낌
             od.rounded_rectangle(
-                [(8, ty), (SCREEN_WIDTH - 8, ty + TOAST_H)],
-                radius=16, outline=(210, 210, 215, 160), width=1)
+                [(TX1, ty), (TX2, ty + TOAST_H)],
+                radius=TRAD, outline=(255, 255, 255, 160), width=2)
+            # 내부 하이라이트
+            od.rounded_rectangle(
+                [(TX1 + 2, ty + 2), (TX2 - 2, ty + TOAST_H - 2)],
+                radius=TRAD - 2, outline=(255, 255, 255, 80), width=1)
             img = Image.alpha_composite(img, overlay)
+
+            # 좌측 그라데이션 쉐도우 (흰 배경에서도 프레임 구분)
+            shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            for gx in range(20):
+                alpha = int(35 * (1 - gx / 20))  # 35→0 fade
+                sd = ImageDraw.Draw(shadow)
+                sd.line([(TX1 + gx, ty + TRAD), (TX1 + gx, ty + TOAST_H - TRAD)],
+                        fill=(0, 0, 0, alpha), width=1)
+            # 좌측 상하 코너 부분도 부드럽게
+            img = Image.alpha_composite(img, shadow)
 
             d = ImageDraw.Draw(img)
 
-            ei = emoji("email", 42)
-            img.paste(ei, (20, ty + 14), ei.split()[3] if ei.mode == "RGBA" else None)
+            # 아이콘 (이름과 내용 동일 왼쪽 정렬)
+            ei = emoji("email", 30)
+            img.paste(ei, (TX1 + 10, ty + 12), ei.split()[3] if ei.mode == "RGBA" else None)
 
-            sender = _fit_text(em["sender"], font(40, 600), SCREEN_WIDTH - 190)
-            d.text((70, ty + 10), sender, font=font(40, 600), fill=C_DARK_TEXT)
+            # 이름: 아이콘 옆 (28pt)
+            sender = _fit_text(em["sender"], font(28, 600), TX2 - TX1 - 150)
+            d.text((TX1 + 44, ty + 10), sender, font=font(28, 600), fill=C_DARK_TEXT)
 
+            # 시간: 우측 정렬 (23pt, 텍스트 너비 기반)
             age = time.time() - em["timestamp"]
             if age < 60:
                 at = "방금"
@@ -733,16 +814,103 @@ def render(weather, air, allday, timed, toasts, toast_off):
                 at = f"{int(age/60)}분 전"
             else:
                 at = f"{int(age/3600)}시간 전"
-            d.text((SCREEN_WIDTH - 120, ty + 18), at, font=font(24), fill=C_GRAY_TEXT)
+            tf = font(23)
+            tw = tf.getlength(at) if hasattr(tf, "getlength") else d.textlength(at, font=tf)
+            d.text((TX2 - 10 - int(tw), ty + 14), at, font=tf, fill=C_GRAY_TEXT)
 
+            # 제목: 아이콘과 동일 x 정렬 (25pt, 축소)
             subj = _fit_text(
                 em.get("subject", em.get("snippet", "")),
-                font(34, 500), SCREEN_WIDTH - 90)
-            d.text((70, ty + 70), subj, font=font(34, 500), fill=C_GRAY_TEXT)
+                font(25, 500), TX2 - TX1 - 30)
+            d.text((TX1 + 10, ty + 52), subj, font=font(25, 500), fill=C_GRAY_TEXT)
 
         img = img.convert("RGB")
 
     return img
+
+
+def render_toast_partial(body_cache, toasts, toast_off):
+    """body_cache(480x1600)의 하단에 토스트 오버레이 → partial 이미지(480xTOAST_AREA_H) 반환."""
+    if not toasts or body_cache is None:
+        return None
+
+    body_h = SCREEN_HEIGHT - HEADER_H
+    crop_y = body_h - TOAST_AREA_H
+    TX1, TX2 = 28, SCREEN_WIDTH - 28
+    TRAD = 28
+
+    img = body_cache.crop((0, crop_y, SCREEN_WIDTH, body_h)).copy()
+    img = img.convert("RGBA")
+
+    for i, em in enumerate(toasts):
+        ty_screen = SCREEN_HEIGHT - TOAST_MARGIN - (i + 1) * (TOAST_H + TOAST_PAD) + toast_off
+        ty = ty_screen - HEADER_H - crop_y
+
+        if ty > TOAST_AREA_H or ty + TOAST_H < 0:
+            continue
+
+        cx1, cy1 = TX1, max(0, ty)
+        cx2, cy2 = TX2, min(TOAST_AREA_H, ty + TOAST_H)
+        if cy2 > cy1:
+            region = img.crop((cx1, cy1, cx2, cy2))
+            blurred = region.filter(ImageFilter.GaussianBlur(30))
+            mask = Image.new("L", (cx2 - cx1, cy2 - cy1), 0)
+            md = ImageDraw.Draw(mask)
+            ry1 = max(0, ty) - ty
+            ry2 = min(TOAST_AREA_H, ty + TOAST_H) - ty
+            md.rounded_rectangle(
+                [(0, ry1), (cx2 - cx1, ry2)],
+                radius=TRAD, fill=255)
+            img.paste(blurred, (cx1, cy1), mask)
+
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        od.rounded_rectangle(
+            [(TX1, ty), (TX2, ty + TOAST_H)],
+            radius=TRAD, fill=(255, 255, 255, 70))
+        od.rounded_rectangle(
+            [(TX1, ty), (TX2, ty + TOAST_H)],
+            radius=TRAD, outline=(255, 255, 255, 160), width=2)
+        od.rounded_rectangle(
+            [(TX1 + 2, ty + 2), (TX2 - 2, ty + TOAST_H - 2)],
+            radius=TRAD - 2, outline=(255, 255, 255, 80), width=1)
+        img = Image.alpha_composite(img, overlay)
+
+        # 좌측 그라데이션 쉐도우
+        shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        for gx in range(20):
+            alpha = int(35 * (1 - gx / 20))
+            sd = ImageDraw.Draw(shadow)
+            sd.line([(TX1 + gx, ty + TRAD), (TX1 + gx, ty + TOAST_H - TRAD)],
+                    fill=(0, 0, 0, alpha), width=1)
+        img = Image.alpha_composite(img, shadow)
+
+        d = ImageDraw.Draw(img)
+
+        ei = emoji("email", 30)
+        img.paste(ei, (TX1 + 10, ty + 12), ei.split()[3] if ei.mode == "RGBA" else None)
+
+        sender = _fit_text(em["sender"], font(28, 600), TX2 - TX1 - 150)
+        d.text((TX1 + 44, ty + 10), sender, font=font(28, 600), fill=C_DARK_TEXT)
+
+        age = time.time() - em["timestamp"]
+        if age < 60:
+            at = "방금"
+        elif age < 3600:
+            at = f"{int(age/60)}분 전"
+        else:
+            at = f"{int(age/3600)}시간 전"
+        tf = font(23)
+        tw = tf.getlength(at) if hasattr(tf, "getlength") else d.textlength(at, font=tf)
+        d.text((TX2 - 10 - int(tw), ty + 14), at, font=tf, fill=C_GRAY_TEXT)
+
+        subj = _fit_text(
+            em.get("subject", em.get("snippet", "")),
+            font(25, 500), TX2 - TX1 - 30)
+        d.text((TX1 + 10, ty + 52), subj, font=font(25, 500), fill=C_GRAY_TEXT)
+
+    return img.convert("RGB")
+
 
 # ─── System Tray ──────────────────────────────────────────────────────────
 
@@ -877,7 +1045,8 @@ def main():
     _load_video()
 
     toast = ToastManager()
-    weather = air = None
+    weather = None
+    air = {"pm10": "--", "pm25": "--", "grade": 2, "grade_text": "보통", "grade_emoji": "moderate"}
     allday, timed = [], []
     last_api = 0
     last_email = 0
@@ -918,6 +1087,7 @@ def main():
 
                 if now - last_email >= TOAST_CHECK_SEC:
                     emails = fetch_emails()
+                    print(f"[Gmail] fetched {len(emails)} unread, toast phase={toast.phase}")
                     toast.update(emails)
                     last_email = time.time()
                     if emails:
@@ -950,29 +1120,38 @@ def main():
         except Exception as e:
             print(f"[Turzx] Init display: {e}")
 
+    _toast_was_active = False
+
     while not _exit:
         try:
             if _paused:
                 time.sleep(1)
                 continue
 
-            t_list, t_off = toast.tick()
-
             if has_video and screen:
                 # ── 영상 모드 ──
-                # body 변경 시: partial update (y=HEADER_H) + 딜레이
-                if body_image is None or _body_dirty or toast.animating:
+                t_list, t_off = toast.tick()
+
+                # 1) body: 데이터 변경 or 토스트 애니메이션 시
+                need_body = (body_image is None
+                             or _body_dirty
+                             or toast.animating
+                             or (toast.is_active and not _toast_was_active)
+                             or (not toast.is_active and _toast_was_active))
+                if need_body:
                     full = render(weather, air, allday, timed, t_list, t_off)
                     body_image = full.crop((0, HEADER_H, SCREEN_WIDTH, SCREEN_HEIGHT))
                     try:
                         screen.DisplayPILImage(body_image, x=0, y=HEADER_H)
-                        time.sleep(0.5)   # body 처리 대기 후 header 재개
+                        time.sleep(0.3)
                     except Exception as e:
                         print(f"[Display] body: {e}")
                     _body_dirty = False
                     last_body = time.time()
 
-                # header(320px) partial update — 매 프레임
+                _toast_was_active = toast.is_active
+
+                # 2) header(320px) 영상 — 매 프레임
                 header_img = render_header(weather, air)
                 try:
                     screen.DisplayPILImage(header_img, x=0, y=0)
@@ -981,6 +1160,7 @@ def main():
 
             else:
                 # ── 정적 모드: partial update로 분할 전송 ──
+                t_list, t_off = toast.tick()
                 image = render(weather, air, allday, timed, t_list, t_off)
                 if screen:
                     try:
