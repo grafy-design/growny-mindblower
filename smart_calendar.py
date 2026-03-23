@@ -188,19 +188,30 @@ def fetch_air():
             "https://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getMsrstnAcctoRltmMesureDnsty",
             params={
                 "serviceKey": GOV_API_KEY, "returnType": "json",
-                "numOfRows": 1, "pageNo": 1,
+                "numOfRows": 5, "pageNo": 1,
                 "stationName": STATION_NAME, "dataTerm": "DAILY", "ver": "1.5",
             }, timeout=10,
         )
-        item = resp.json()["response"]["body"]["items"][0]
-        g10 = int(item.get("pm10Grade1h") or 0)
-        g25 = int(item.get("pm25Grade1h") or 0)
-        grade = max(g10, g25) or 2
-        gt, ge = GRADE_MAP.get(grade, ("보통", "moderate"))
+        items = resp.json()["response"]["body"]["items"]
+        # 최신 시간부터 유효한 pm10 데이터가 있는 항목 탐색
+        for item in items:
+            pm10 = item.get("pm10Value", "-")
+            if pm10 and pm10 != "-":
+                g10 = int(item.get("pm10Grade1h") or 0)
+                g25 = int(item.get("pm25Grade1h") or 0)
+                grade = max(g10, g25) or 2
+                gt, ge = GRADE_MAP.get(grade, ("보통", "moderate"))
+                return {
+                    "pm10": pm10,
+                    "pm25": item.get("pm25Value", "-"),
+                    "grade": grade, "grade_text": gt, "grade_emoji": ge,
+                }
+        # 모든 항목이 "-"인 경우 최신 항목 그대로 반환
+        item = items[0]
         return {
             "pm10": item.get("pm10Value", "-"),
             "pm25": item.get("pm25Value", "-"),
-            "grade": grade, "grade_text": gt, "grade_emoji": ge,
+            "grade": 2, "grade_text": "보통", "grade_emoji": "moderate",
         }
     except Exception as e:
         print(f"[Air] {e}")
@@ -922,6 +933,22 @@ def main():
 
     # 첫 API 호출 완료 대기
     time.sleep(8)
+
+    # ── 공식 프로토콜: 최초 1회 풀스크린 전송으로 디스플레이 초기화 ──
+    if screen:
+        try:
+            init_img = render(weather, air, allday, timed, [], 0)
+            if has_video:
+                vf = render_header(weather, air)
+                init_img.paste(vf, (0, 0))
+            screen.DisplayPILImage(init_img)  # 풀스크린 (초기화용, 1회만)
+            print("[Turzx] Initial full-screen sent (protocol init)")
+            time.sleep(1)
+            # Count.Start 리셋 — 이후 partial이 0부터 시작하도록
+            from library.lcd.lcd_comm_rev_c import Count
+            Count.Start = 0
+        except Exception as e:
+            print(f"[Turzx] Init display: {e}")
 
     while not _exit:
         try:
