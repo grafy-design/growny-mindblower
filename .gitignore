@@ -6,3 +6,6 @@ dist/
 log.log
 *.egg-info/
 .env
+mov/*.mp4
+!mov/converted/
+!mov/header_sunny.mp4

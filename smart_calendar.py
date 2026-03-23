@@ -405,19 +405,73 @@ class ToastManager:
 
 # ─── Video Background ─────────────────────────────────────────────────────
 
-_video_frames = []   # 프리로드된 PIL 프레임 (정방향+역방향 루프)
-_video_idx = 0
+# ─── 시간+날씨 기반 영상 시스템 ──────────────────────────────────────────
+# 시간대별 영상 매핑: (start_hour, end_hour, sunny_file, rainy_file)
+_VIDEO_SLOTS = [
+    (3,  6,  "22-08_sunny.mp4", "03-10_rainy.mp4"),
+    (6,  8,  "06-08_sunny.mp4", "03-10_rainy.mp4"),
+    (8,  11, "08-11_sunny.mp4", "03-10_rainy.mp4"),
+    (11, 13, "11-16_sunny.mp4", "10-13_rainy.mp4"),
+    (13, 15, "11-16_sunny.mp4", "13-17_rainy.mp4"),
+    (15, 17, "15-17_sunny.mp4", "13-17_rainy.mp4"),
+    (17, 19, "17-19_sunny.mp4", "17-20_rainy.mp4"),
+    (19, 20, "19-22_sunny.mp4", "17-20_rainy.mp4"),
+    (20, 22, "19-22_sunny.mp4", "20-03_rainy.mp4"),
+    (22, 27, "22-08_sunny.mp4", "20-03_rainy.mp4"),  # 22~03 (27=03+24)
+]
+_NIGHT_HOURS = set(range(19, 27)) | set(range(0, 7))  # 19~06 = dark
 
-def _load_video():
-    """헤더 배경 영상 프리로드. 정방향 + 역방향 무한루프용."""
-    global _video_frames
+_video_frames = []
+_video_idx = 0
+_video_current_key = ""       # "sunny/08-11" 등 현재 로드된 키
+_video_fade_frames = []       # 페이드 전환 프레임 큐
+_video_fade_idx = 0
+_video_loading = False        # 백그라운드 로딩 중
+
+# 하단 그라데이션 오버레이 캐시
+_header_gradient = None
+
+def _build_header_gradient():
+    """헤더 하단 검은색 그라데이션 오버레이 생성 (1회)."""
+    global _header_gradient
+    grad = Image.new("RGBA", (SCREEN_WIDTH, HEADER_H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(grad)
+    for y in range(HEADER_H // 2, HEADER_H):
+        t = (y - HEADER_H // 2) / (HEADER_H // 2)  # 0→1
+        alpha = int(150 * t)
+        gd.line([(0, y), (SCREEN_WIDTH, y)], fill=(0, 0, 0, alpha))
+    _header_gradient = grad
+
+def _get_video_slot(hour, is_rainy):
+    """현재 시간+날씨로 영상 파일명과 키 반환."""
+    h = hour if hour >= 3 else hour + 24  # 0~2시 → 24~26으로 매핑
+    for s, e, sunny, rainy in _VIDEO_SLOTS:
+        if s <= h < e:
+            fname = rainy if is_rainy else sunny
+            key = f"{'rainy' if is_rainy else 'sunny'}/{fname}"
+            return fname, key
+    # fallback
+    return "22-08_sunny.mp4", "sunny/22-08_sunny.mp4"
+
+def _is_night(hour):
+    h = hour if hour >= 3 else hour + 24
+    return h in _NIGHT_HOURS
+
+def _load_video_file(filename=None):
+    """영상 파일 프리로드. filename 없으면 기본 header_sunny.mp4."""
+    global _video_frames, _video_idx
     if not HAS_CV2:
         print("[Video] cv2 없음 — 정적 배경 사용")
-        return
-    path = _res("mov/header_sunny.mp4")
+        return []
+    if filename:
+        path = _res(f"mov/converted/{filename}")
+        if not os.path.exists(path):
+            path = _res(f"mov/{filename}")
+    else:
+        path = _res("mov/header_sunny.mp4")
     if not os.path.exists(path):
-        print(f"[Video] {path} 없음 — 정적 배경 사용")
-        return
+        print(f"[Video] {path} 없음")
+        return []
     cap = cv2.VideoCapture(path)
     forward = []
     while True:
@@ -425,18 +479,121 @@ def _load_video():
         if not ret:
             break
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        forward.append(Image.fromarray(rgb))
+        pil = Image.fromarray(rgb)
+        if pil.size != (SCREEN_WIDTH, HEADER_H):
+            pil = pil.resize((SCREEN_WIDTH, HEADER_H), Image.LANCZOS)
+        forward.append(pil)
     cap.release()
     if not forward:
-        return
+        return []
     reverse = forward[-2:0:-1]
-    _video_frames = forward + reverse
-    mem = len(_video_frames) * 480 * 320 * 3 / 1024 / 1024
-    print(f"[Video] {len(forward)}프레임 로드, 루프 {len(_video_frames)}프레임 ({mem:.0f}MB)")
+    frames = forward + reverse
+    mem = len(frames) * SCREEN_WIDTH * HEADER_H * 3 / 1024 / 1024
+    print(f"[Video] {filename}: {len(forward)}fr → loop {len(frames)}fr ({mem:.0f}MB)")
+    return frames
+
+def _load_video():
+    """초기 영상 로드."""
+    global _video_frames, _video_idx, _video_current_key
+    _build_header_gradient()
+    n = now_kst()
+    is_rainy = False  # 초기엔 sunny
+    fname, key = _get_video_slot(n.hour, is_rainy)
+    _video_frames = _load_video_file(fname)
+    _video_idx = 0
+    _video_current_key = key
+    if not _video_frames:
+        # fallback: header_sunny.mp4
+        _video_frames = _load_video_file()
+        _video_current_key = "fallback"
+
+def _generate_fade_frames(fade_color, count=12):
+    """페이드 프레임 생성. fade_color=(R,G,B), count=프레임수."""
+    frames = []
+    solid = Image.new("RGB", (SCREEN_WIDTH, HEADER_H), fade_color)
+    # 현재 재생 중인 프레임에서 fade-out
+    if _video_frames:
+        cur = _video_frames[_video_idx % len(_video_frames)]
+    else:
+        cur = Image.new("RGB", (SCREEN_WIDTH, HEADER_H), (0, 0, 0))
+    for i in range(count):
+        alpha = (i + 1) / count  # 0→1 (점점 단색)
+        blended = Image.blend(cur, solid, alpha)
+        frames.append(blended)
+    return frames, fade_color
+
+def _generate_fadein_frames(new_frames, fade_color, count=12):
+    """새 영상 첫 프레임으로 fade-in. fade_color→영상."""
+    frames = []
+    solid = Image.new("RGB", (SCREEN_WIDTH, HEADER_H), fade_color)
+    target = new_frames[0] if new_frames else solid
+    for i in range(count):
+        alpha = (i + 1) / count  # 0→1 (점점 영상)
+        blended = Image.blend(solid, target, alpha)
+        frames.append(blended)
+    return frames
+
+def check_video_switch(weather_emoji):
+    """날씨/시간 변경 시 영상 전환. 메인 루프에서 호출."""
+    global _video_frames, _video_idx, _video_current_key
+    global _video_fade_frames, _video_fade_idx, _video_loading
+    if _video_loading:
+        return
+    n = now_kst()
+    is_rainy = weather_emoji in ("weather_rain", "weather_thunderstorm")
+    fname, key = _get_video_slot(n.hour, is_rainy)
+    if key == _video_current_key:
+        return
+    print(f"[Video] 전환: {_video_current_key} → {key}")
+    _video_loading = True
+
+    # fade-out 색상 결정
+    cur_night = _is_night(n.hour)
+    new_fname_night = _is_night(n.hour)  # 새 시간대도 체크
+    if cur_night:
+        fadeout_color = (0, 0, 0)
+    else:
+        fadeout_color = (255, 255, 255)
+
+    # fade-out 프레임 생성
+    fade_out, _ = _generate_fade_frames(fadeout_color, 12)
+
+    # 백그라운드에서 새 영상 로드
+    def _bg_load():
+        global _video_frames, _video_idx, _video_current_key
+        global _video_fade_frames, _video_fade_idx, _video_loading
+        new_frames = _load_video_file(fname)
+        if not new_frames:
+            _video_loading = False
+            return
+        # fade-in 색상: 새 시간대 기준
+        if _is_night(n.hour):
+            fadein_color = (0, 0, 0)
+        else:
+            fadein_color = (255, 255, 255)
+        fade_in = _generate_fadein_frames(new_frames, fadein_color, 12)
+        _video_fade_frames = fade_out + fade_in
+        _video_fade_idx = 0
+        # 로드 완료 후 교체
+        _video_frames = new_frames
+        _video_idx = 0
+        _video_current_key = key
+        _video_loading = False
+        print(f"[Video] 전환 완료: {key}")
+
+    threading.Thread(target=_bg_load, daemon=True).start()
 
 def _next_video_frame():
-    """다음 영상 프레임 반환. 없으면 None."""
-    global _video_idx
+    """다음 영상 프레임 반환 (페이드 전환 포함). 없으면 None."""
+    global _video_idx, _video_fade_idx, _video_fade_frames
+    # 페이드 전환 중이면 페이드 프레임 반환
+    if _video_fade_frames and _video_fade_idx < len(_video_fade_frames):
+        frame = _video_fade_frames[_video_fade_idx]
+        _video_fade_idx += 1
+        if _video_fade_idx >= len(_video_fade_frames):
+            _video_fade_frames = []
+            _video_fade_idx = 0
+        return frame
     if not _video_frames:
         return None
     frame = _video_frames[_video_idx]
@@ -527,6 +684,48 @@ def _wrap_text(text, f, max_w, max_lines=2):
     return lines or [text[:1]]
 
 
+def _draw_header_text(img, d, weather, air):
+    """헤더 텍스트 렌더 (날짜, 시간, 날씨, 미세먼지)."""
+    n = now_kst()
+    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+    d.text((30, 28),
+           f"{n.year}년 {n.month}월 {n.day}일 ({weekdays[n.weekday()]})",
+           font=font(45, 700), fill=C_WHITE)
+
+    hr = n.hour
+    ap = "PM" if hr >= 12 else "AM"
+    dh = hr % 12 or 12
+    d.text((30, 72), f"{ap} {dh}:{n.strftime('%M')}",
+           font=font(106, 700), fill=C_WHITE)
+
+    wy = WEATHER_Y
+    wx = 30
+    if weather:
+        we = emoji(weather["emoji"], 63)
+        img.paste(we, (wx, wy), we.split()[3] if we.mode == "RGBA" else None)
+        d = ImageDraw.Draw(img)
+        wt = f"{weather['text']} / {weather['temp']:.0f}°" if isinstance(weather['temp'], (int, float)) else f"{weather['text']} / {weather['temp']}°"
+        d.text((wx + 80, wy + 18), wt, font=font(28, 600), fill=C_WHITE)
+        wx = wx + 80 + int(font(28, 600).getlength(wt)) + 18
+        # 구분선 | (이모지 높이만큼)
+        d.line([(wx, wy), (wx, wy + 57)], fill=(255, 255, 255, 140), width=1)
+        wx += 15 + 15  # |라인 뒤 15px + 이모지 앞 15px
+
+    if air:
+        ae = emoji(air["grade_emoji"], 57)
+        img.paste(ae, (wx, wy + 3), ae.split()[3] if ae.mode == "RGBA" else None)
+        d = ImageDraw.Draw(img)
+        gc = GRADE_COLOR.get(air["grade"], (80, 200, 100))
+        badge_text = f"{air['pm10']} ({air['grade_text']})"
+        bf = font(22, 600)
+        tw = bf.getlength(badge_text)
+        bx = wx + 62 + 15  # 이모지↔뱃지 15px 간격
+        d.rounded_rectangle(
+            [(bx, wy + 18), (bx + tw + 20, wy + 50)],
+            radius=16, fill=gc)
+        d.text((bx + 10, wy + 20), badge_text, font=bf, fill=C_WHITE)
+
+
 def render_header(weather, air):
     """헤더만 빠르게 렌더 (영상 배경 + 텍스트). 480×320 반환."""
     vf = _next_video_frame()
@@ -537,44 +736,14 @@ def render_header(weather, air):
         d = ImageDraw.Draw(img)
         w_emoji = weather["emoji"] if weather else None
         _draw_header_bg(img, d, w_emoji)
+    # 하단 검은색 그라데이션 오버레이 (날씨/미세먼지 가독성)
+    if _header_gradient:
+        img = img.convert("RGBA")
+        img = Image.alpha_composite(img, _header_gradient)
+        img = img.convert("RGB")
     d = ImageDraw.Draw(img)
 
-    n = now_kst()
-    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
-    d.text((30, 28),
-           f"{n.year}년 {n.month}월 {n.day}일 ({weekdays[n.weekday()]})",
-           font=font(46, 700), fill=C_WHITE)
-
-    hr = n.hour
-    ap = "PM" if hr >= 12 else "AM"
-    dh = hr % 12 or 12
-    d.text((30, 90), f"{ap} {dh}:{n.strftime('%M')}",
-           font=font(80, 700), fill=C_WHITE)
-
-    wy = WEATHER_Y
-    wx = 30
-    if weather:
-        we = emoji(weather["emoji"], 63)
-        img.paste(we, (wx, wy), we.split()[3] if we.mode == "RGBA" else None)
-        d = ImageDraw.Draw(img)
-        wt = f"{weather['text']} / {weather['temp']:.0f}°"
-        d.text((wx + 70, wy + 18), wt, font=font(28, 600), fill=C_WHITE)
-        wx = wx + 70 + int(font(28, 600).getlength(wt)) + 24
-
-    if air:
-        ae = emoji(air["grade_emoji"], 57)
-        img.paste(ae, (wx, wy + 3), ae.split()[3] if ae.mode == "RGBA" else None)
-        d = ImageDraw.Draw(img)
-        gc = GRADE_COLOR.get(air["grade"], (80, 200, 100))
-        badge_text = f"{air['pm10']} ({air['grade_text']})"
-        bf = font(22, 600)
-        tw = bf.getlength(badge_text)
-        bx = wx + 62
-        d.rounded_rectangle(
-            [(bx, wy + 18), (bx + tw + 20, wy + 50)],
-            radius=16, fill=gc)
-        d.text((bx + 10, wy + 20), badge_text, font=bf, fill=C_WHITE)
-
+    _draw_header_text(img, d, weather, air)
     return img
 
 
@@ -587,41 +756,7 @@ def render(weather, air, allday, timed, toasts, toast_off):
     w_emoji = weather["emoji"] if weather else None
     _draw_header_bg(img, d, w_emoji)
     d = ImageDraw.Draw(img)
-
-    weekdays = ["월", "화", "수", "목", "금", "토", "일"]
-    d.text((30, 28),
-           f"{n.year}년 {n.month}월 {n.day}일 ({weekdays[n.weekday()]})",
-           font=font(46, 700), fill=C_WHITE)
-
-    hr = n.hour
-    ap = "PM" if hr >= 12 else "AM"
-    dh = hr % 12 or 12
-    d.text((30, 90), f"{ap} {dh}:{n.strftime('%M')}",
-           font=font(80, 700), fill=C_WHITE)
-
-    wy = WEATHER_Y
-    wx = 30
-    if weather:
-        we = emoji(weather["emoji"], 63)
-        img.paste(we, (wx, wy), we.split()[3] if we.mode == "RGBA" else None)
-        d = ImageDraw.Draw(img)
-        wt = f"{weather['text']} / {weather['temp']:.0f}°"
-        d.text((wx + 70, wy + 18), wt, font=font(28, 600), fill=C_WHITE)
-        wx = wx + 70 + int(font(28, 600).getlength(wt)) + 24
-
-    if air:
-        ae = emoji(air["grade_emoji"], 57)
-        img.paste(ae, (wx, wy + 3), ae.split()[3] if ae.mode == "RGBA" else None)
-        d = ImageDraw.Draw(img)
-        gc = GRADE_COLOR.get(air["grade"], (80, 200, 100))
-        badge_text = f"{air['pm10']} ({air['grade_text']})"
-        bf = font(22, 600)
-        tw = bf.getlength(badge_text)
-        bx = wx + 62
-        d.rounded_rectangle(
-            [(bx, wy + 18), (bx + tw + 20, wy + 50)],
-            radius=16, fill=gc)
-        d.text((bx + 10, wy + 20), badge_text, font=bf, fill=C_WHITE)
+    _draw_header_text(img, d, weather, air)
 
     # ── Zone C: All-Day Events (폰트 29, 픽셀 기반 truncation) ───────
     yp = HEADER_H + 8
@@ -645,8 +780,8 @@ def render(weather, air, allday, timed, toasts, toast_off):
     if allday:
         yp += 6
 
-    # ── Zone D: Timeline (38px 줄바꿈, 시간 하단, 이모지 정리) ───────
-    tl_top = yp
+    # ── Zone D: Timeline ─────────────────────────────────────────────
+    tl_top = yp + 7  # 종일 일정과 타임라인 사이 패딩
     tl_bot = SCREEN_HEIGHT - 15
     total_h = HOUR_END - HOUR_START
     hh = (tl_bot - tl_top) / total_h
@@ -654,63 +789,77 @@ def render(weather, air, allday, timed, toasts, toast_off):
     EVT_BORDER_W = 1
     EVT_TITLE_FONT = font(38, 600)
     EVT_TIME_FONT = font(22)
-    EVT_TEXT_X = 97
-    EVT_TEXT_W = SCREEN_WIDTH - 10 - EVT_TEXT_X  # 사용 가능 폭
+    HOUR_LABEL_FONT = font(30, 700)  # Pretendard Bold
+    HOUR_LABEL_W = 50                # 시간 레이블 영역 폭
+    EVT_LEFT = HOUR_LABEL_W + 8     # 이벤트 시작 x
+    EVT_RIGHT = SCREEN_WIDTH - 10    # 이벤트 끝 x
+    EVT_FULL_W = EVT_RIGHT - EVT_LEFT
 
-    # Hour grid
+    # Hour grid — 큰 숫자 (8~24)
     for h in range(HOUR_START, HOUR_END + 1):
         hy = tl_top + (h - HOUR_START) * hh
-        if h < 12:
-            lb = f"AM {h}시"
-        elif h == 12:
-            lb = "PM 12시"
-        elif h == 24:
-            lb = "자정"
-        else:
-            lb = f"PM {h-12}시"
-        d.text((8, hy - 10), lb, font=font(18), fill=C_HOUR)
-        d.line([(75, hy), (SCREEN_WIDTH - 8, hy)], fill=C_LINE, width=1)
+        lb = str(h)
+        d.text((8, hy - 16), lb, font=HOUR_LABEL_FONT, fill=C_HOUR)
+        d.line([(EVT_LEFT - 4, hy), (SCREEN_WIDTH - 8, hy)], fill=C_LINE, width=1)
 
-    # Timed events
+    # ── 겹침 감지 + 컬럼 배정 ──
+    ev_rects = []  # (sh, eh, ev, y1, y2, col)
     for ev in timed:
         sh = ev["start"].hour + ev["start"].minute / 60
         eh = ev["end"].hour + ev["end"].minute / 60
-        # 자정(0시) 종료 = 다음날 → 24시로 처리
         if eh <= sh:
             eh = 24
         if eh <= HOUR_START or sh >= HOUR_END:
             continue
         sh = max(sh, HOUR_START)
         eh = min(eh, HOUR_END)
-
         y1 = tl_top + (sh - HOUR_START) * hh + EVT_GAP
         y2 = tl_top + (eh - HOUR_START) * hh - EVT_GAP
+        if eh >= HOUR_END:
+            y2 += 7  # 24시 끝 이벤트 하단 확장
         if y2 - y1 < 80:
             y2 = y1 + 80
+        # 컬럼 배정: 이전 이벤트와 겹치면 col 증가
+        col = 0
+        for _, prev_eh, _, _, _, prev_col in ev_rects:
+            if sh < prev_eh and eh > sh:
+                # 시간 겹침 → 같은 col이면 다음 col
+                if prev_col >= col:
+                    col = prev_col + 1
+        ev_rects.append((sh, eh, ev, y1, y2, col))
+
+    # Timed events — 컬럼별 폭 축소
+    for sh, eh, ev, y1, y2, col in ev_rects:
+        shrink = 0.15 * col  # col0=100%, col1=85%, col2=70%...
+        evt_w = int(EVT_FULL_W * (1 - shrink))
+        ex1 = EVT_RIGHT - evt_w   # 오른쪽 정렬
+        ex2 = EVT_RIGHT
+        bar_x2 = ex1 + 8          # 좌측 컬러바
 
         c = hex_rgb(ev["color"])
         lc = tuple(min(255, int(v * 0.35 + 255 * 0.65)) for v in c)
         border_c = tuple(min(255, int(v * 0.6 + 100 * 0.4)) for v in c)
 
         d.rounded_rectangle(
-            [(80, y1), (SCREEN_WIDTH - 10, y2)],
+            [(ex1, y1), (ex2, y2)],
             radius=10, fill=lc, outline=border_c, width=EVT_BORDER_W)
-        d.rounded_rectangle([(80, y1), (88, y2)], radius=4, fill=c)
+        d.rounded_rectangle([(ex1, y1), (bar_x2, y2)], radius=4, fill=c)
 
+        text_x = ex1 + 17
+        text_w = ex2 - text_x - 6
         title = _clean_title(ev["summary"])
         block_h = y2 - y1
-        time_h = 28           # 시간 텍스트 영역
-        title_area = block_h - time_h - 12  # 상단 패딩 6 + 하단 패딩 6
-        line_h = 44           # 38px font + 6px gap
+        time_h = 28
+        title_area = block_h - time_h - 12
+        line_h = 44
         max_lines = max(1, int(title_area / line_h))
-        lines = _wrap_text(title, EVT_TITLE_FONT, EVT_TEXT_W, max_lines)
+        lines = _wrap_text(title, EVT_TITLE_FONT, text_w, max_lines)
 
         for li, line in enumerate(lines):
-            d.text((EVT_TEXT_X, y1 + 6 + li * line_h), line,
+            d.text((text_x, y1 + 6 + li * line_h), line,
                    font=EVT_TITLE_FONT, fill=C_DARK_TEXT)
 
-        # 시간 표시: 블록 하단에 배치
-        d.text((EVT_TEXT_X, y2 - 28), ev["time_str"],
+        d.text((text_x, y2 - 28), ev["time_str"],
                font=EVT_TIME_FONT, fill=C_GRAY_TEXT)
 
     # NOW line — 레드 글래스모피즘
@@ -1045,7 +1194,7 @@ def main():
     _load_video()
 
     toast = ToastManager()
-    weather = None
+    weather = {"temp": "--", "text": "로딩중", "emoji": "weather_clear"}
     air = {"pm10": "--", "pm25": "--", "grade": 2, "grade_text": "보통", "grade_emoji": "moderate"}
     allday, timed = [], []
     last_api = 0
@@ -1076,6 +1225,9 @@ def main():
                         air = a
                     last_weather = time.time()
                     _body_dirty = True
+                    # 날씨/시간 변경 시 영상 전환 체크
+                    w_emoji = weather["emoji"] if weather else "weather_clear"
+                    check_video_switch(w_emoji)
 
                 # 캘린더 이벤트: 15초마다
                 if now - last_api >= API_REFRESH_SEC or _force:
@@ -1217,6 +1369,11 @@ def preview():
             state["last_email"] = now
 
     class Handler(BaseHTTPRequestHandler):
+        def handle(self):
+            try:
+                super().handle()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # 브라우저 연결 끊김 무시
         def do_GET(self):
             if self.path == "/" or self.path == "/index.html":
                 self.send_response(200)
@@ -1230,21 +1387,46 @@ def preview():
   img {{ height:90vh; image-rendering:auto; border:2px solid #333; border-radius:8px; }}
   .wrap {{ text-align:center; }}
   h3 {{ color:#888; font-family:sans-serif; margin:8px 0; }}
+  .btn {{ background:#333; color:#ccc; border:1px solid #555; padding:6px 16px; border-radius:6px; cursor:pointer; font-size:14px; margin:4px; }}
+  .btn:hover {{ background:#555; }}
+  .btn.active {{ background:#c44; color:#fff; }}
 </style>
 </head><body>
 <div class="wrap">
-  <h3>Turzx 8.8" Preview (480x1920) - Auto-refresh {DISPLAY_REFRESH_SEC}s - port {port}</h3>
+  <h3>Turzx 8.8" Preview (480x1920) - Auto-refresh {DISPLAY_REFRESH_SEC}s</h3>
+  <div>
+    <button class="btn" onclick="toggleMock()" id="mockBtn">Mock Toast</button>
+    <button class="btn" onclick="location.reload()">Refresh</button>
+  </div>
   <img src="/render.png?t=" id="img">
 </div>
 <script>
-  setInterval(() => {{
-    document.getElementById('img').src = '/render.png?t=' + Date.now();
-  }}, {DISPLAY_REFRESH_SEC * 1000});
+  let mock = false;
+  function toggleMock() {{
+    mock = !mock;
+    document.getElementById('mockBtn').className = mock ? 'btn active' : 'btn';
+    update();
+  }}
+  function update() {{
+    const q = mock ? '&mock=1' : '';
+    document.getElementById('img').src = '/render.png?t=' + Date.now() + q;
+  }}
+  setInterval(update, {DISPLAY_REFRESH_SEC * 1000});
 </script>
 </body></html>""".encode())
             elif self.path.startswith("/render.png"):
                 refresh_data()
-                t_list, t_off = toast.tick()
+                # ?mock=1 → 디자인 캡처용 mock toast 강제 표시
+                if "mock=1" in self.path:
+                    mock_toasts = [
+                        {"sender": "김민수", "subject": "회의 일정 변경 안내드립니다",
+                         "timestamp": time.time() - 180, "snippet": ""},
+                        {"sender": "이지영 팀장", "subject": "주간 보고서 검토 부탁드려요",
+                         "timestamp": time.time() - 7200, "snippet": ""},
+                    ]
+                    t_list, t_off = mock_toasts, 0
+                else:
+                    t_list, t_off = toast.tick()
                 img = render(state["weather"], state["air"],
                              state["allday"], state["timed"], t_list, t_off)
                 buf = io.BytesIO()
