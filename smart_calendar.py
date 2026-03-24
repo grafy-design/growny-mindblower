@@ -3,12 +3,48 @@
 
 import os
 import sys
+import io
 import time
 import datetime
 import threading
+import tempfile
+import subprocess
 import requests
 import urllib.parse
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+# ─── In-memory log buffer ─────────────────────────────────────────────────
+_log_buffer = io.StringIO()
+_log_lock = threading.Lock()
+_LOG_MAX = 5000  # 최대 줄 수
+
+def _log(msg):
+    """print 대체 — 콘솔 + 메모리 버퍼 동시 기록."""
+    line = f"{datetime.datetime.now().strftime('%H:%M:%S')} {msg}"
+    print(line)
+    with _log_lock:
+        _log_buffer.write(line + "\n")
+        # 버퍼 크기 제한
+        if _log_buffer.tell() > 500_000:
+            content = _log_buffer.getvalue()
+            lines = content.splitlines()[-_LOG_MAX:]
+            _log_buffer.seek(0)
+            _log_buffer.truncate()
+            _log_buffer.write("\n".join(lines) + "\n")
+
+def _open_log_viewer(icon=None, item=None):
+    """로그를 임시파일에 쓰고 메모장으로 열기."""
+    with _log_lock:
+        content = _log_buffer.getvalue()
+    if not content.strip():
+        content = "(로그 없음)\n"
+    tmp = os.path.join(tempfile.gettempdir(), "growny_mindblower_log.txt")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    try:
+        subprocess.Popen(["notepad.exe", tmp])
+    except Exception:
+        pass
 
 try:
     import cv2
@@ -117,7 +153,7 @@ def emoji(name, size=36):
                 img = img.resize((size, size), Image.LANCZOS)
             _ecache[key] = img
         except Exception as e:
-            print(f"[Emoji] Failed: {path} - {e}")
+            _log(f"[Emoji] Failed: {path} - {e}")
             fb = Image.new("RGBA", (size, size), (200, 200, 200, 255))
             _ecache[key] = fb
     return _ecache[key]
@@ -127,6 +163,12 @@ def hex_rgb(h):
     if len(h) == 3:
         h = "".join(c * 2 for c in h)
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+def _desaturate(rgb):
+    """RGB → 채도 제거 (luminance 기반 grayscale, 약간 밝게 보정)."""
+    g = int(rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114)
+    g = min(255, g + 30)  # 너무 어둡지 않게
+    return (g, g, g)
 
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
@@ -166,7 +208,7 @@ def fetch_weather():
         text, emj = WEATHER_MAP.get(pty, ("맑음", "weather_clear"))
         return {"temp": float(obs.get("T1H", 0)), "text": text, "emoji": emj}
     except Exception as e:
-        print(f"[Weather] {e}")
+        _log(f"[Weather] {e}")
         return None
 
 # ─── API: Air Quality ─────────────────────────────────────────────────────
@@ -216,7 +258,7 @@ def fetch_air():
             "grade": 2, "grade_text": "보통", "grade_emoji": "moderate",
         }
     except Exception as e:
-        print(f"[Air] {e}")
+        _log(f"[Air] {e}")
         return None
 
 # ─── API: Google Calendar ─────────────────────────────────────────────────
@@ -267,7 +309,7 @@ def fetch_events():
                 e["_color"] = _EVENT_COLORS.get(cid_ev, cal_color) if cid_ev else cal_color
             raw.extend(evts)
     except Exception as e:
-        print(f"[Calendar] {e}")
+        _log(f"[Calendar] {e}")
         return [], []
 
     allday, timed = [], []
@@ -319,7 +361,7 @@ def fetch_emails():
             })
         return emails
     except Exception as e:
-        print(f"[Gmail] {e}")
+        _log(f"[Gmail] {e}")
         return []
 
 # ─── Toast Manager ────────────────────────────────────────────────────────
@@ -341,12 +383,12 @@ class ToastManager:
             if not self.is_active:
                 self.phase = "in"
                 self.phase_start = time.time()
-                print(f"[Toast] slide-in {len(emails)} emails")
+                _log(f"[Toast] slide-in {len(emails)} emails")
         else:
             if self.phase in ("in", "show"):
                 self.phase = "out"
                 self.phase_start = time.time()
-                print("[Toast] slide-out (all read)")
+                _log("[Toast] slide-out (all read)")
 
     @property
     def is_active(self):
@@ -386,7 +428,7 @@ class ToastManager:
             if elapsed >= TOAST_DURATION_SEC:
                 self.phase = "out"
                 self.phase_start = now
-                print("[Toast] duration expired, slide-out")
+                _log("[Toast] duration expired, slide-out")
             return self.active, 0
 
         if self.phase == "out":
@@ -396,7 +438,7 @@ class ToastManager:
             if t >= 1.0:
                 self.phase = "done"
                 self.active = []
-                print("[Toast] done")
+                _log("[Toast] done")
             return self.active, offset
 
         return [], 0
@@ -461,7 +503,7 @@ def _load_video_file(filename=None):
     """영상 파일 프리로드. filename 없으면 기본 header_sunny.mp4."""
     global _video_frames, _video_idx
     if not HAS_CV2:
-        print("[Video] cv2 없음 — 정적 배경 사용")
+        _log("[Video] cv2 없음 — 정적 배경 사용")
         return []
     if filename:
         path = _res(f"mov/converted/{filename}")
@@ -470,7 +512,7 @@ def _load_video_file(filename=None):
     else:
         path = _res("mov/header_sunny.mp4")
     if not os.path.exists(path):
-        print(f"[Video] {path} 없음")
+        _log(f"[Video] {path} 없음")
         return []
     cap = cv2.VideoCapture(path)
     forward = []
@@ -489,7 +531,7 @@ def _load_video_file(filename=None):
     reverse = forward[-2:0:-1]
     frames = forward + reverse
     mem = len(frames) * SCREEN_WIDTH * HEADER_H * 3 / 1024 / 1024
-    print(f"[Video] {filename}: {len(forward)}fr → loop {len(frames)}fr ({mem:.0f}MB)")
+    _log(f"[Video] {filename}: {len(forward)}fr → loop {len(frames)}fr ({mem:.0f}MB)")
     return frames
 
 def _load_video():
@@ -544,7 +586,7 @@ def check_video_switch(weather_emoji):
     fname, key = _get_video_slot(n.hour, is_rainy)
     if key == _video_current_key:
         return
-    print(f"[Video] 전환: {_video_current_key} → {key}")
+    _log(f"[Video] 전환: {_video_current_key} → {key}")
     _video_loading = True
 
     # fade-out 색상 결정
@@ -579,7 +621,7 @@ def check_video_switch(weather_emoji):
         _video_idx = 0
         _video_current_key = key
         _video_loading = False
-        print(f"[Video] 전환 완료: {key}")
+        _log(f"[Video] 전환 완료: {key}")
 
     threading.Thread(target=_bg_load, daemon=True).start()
 
@@ -695,8 +737,15 @@ def _draw_header_text(img, d, weather, air):
     hr = n.hour
     ap = "PM" if hr >= 12 else "AM"
     dh = hr % 12 or 12
-    d.text((30, 72), f"{ap} {dh}:{n.strftime('%M')}",
-           font=font(106, 700), fill=C_WHITE)
+    # 날짜 폭 기준 양끝 정렬: PM 왼쪽=30, 시간숫자 오른쪽=30+date_w
+    date_text = f"{n.year}년 {n.month}월 {n.day}일 ({weekdays[n.weekday()]})"
+    date_w = font(45, 700).getlength(date_text)
+    right_edge = 30 + int(date_w)
+    tf = font(98, 700)
+    time_str = f"{dh}:{n.strftime('%M')}"
+    time_w = tf.getlength(time_str)
+    d.text((30, 72), ap, font=tf, fill=C_WHITE)
+    d.text((right_edge - int(time_w), 72), time_str, font=tf, fill=C_WHITE)
 
     wy = WEATHER_Y
     wx = 30
@@ -837,8 +886,13 @@ def render(weather, air, allday, timed, toasts, toast_off):
         bar_x2 = ex1 + 8          # 좌측 컬러바
 
         c = hex_rgb(ev["color"])
+        is_past = ev["end"] <= n
+        if is_past:
+            c = _desaturate(c)
         lc = tuple(min(255, int(v * 0.35 + 255 * 0.65)) for v in c)
         border_c = tuple(min(255, int(v * 0.6 + 100 * 0.4)) for v in c)
+        title_fill = C_DIM if is_past else C_DARK_TEXT
+        time_fill = C_LIGHT if is_past else C_GRAY_TEXT
 
         d.rounded_rectangle(
             [(ex1, y1), (ex2, y2)],
@@ -857,10 +911,10 @@ def render(weather, air, allday, timed, toasts, toast_off):
 
         for li, line in enumerate(lines):
             d.text((text_x, y1 + 6 + li * line_h), line,
-                   font=EVT_TITLE_FONT, fill=C_DARK_TEXT)
+                   font=EVT_TITLE_FONT, fill=title_fill)
 
         d.text((text_x, y2 - 28), ev["time_str"],
-               font=EVT_TIME_FONT, fill=C_GRAY_TEXT)
+               font=EVT_TIME_FONT, fill=time_fill)
 
     # NOW line — 레드 글래스모피즘
     nh = n.hour + n.minute / 60
@@ -1083,45 +1137,85 @@ def _on_exit(icon, item):
 
 def start_tray():
     if not HAS_PYSTRAY:
-        print("[Tray] pystray not available")
+        _log("[Tray] pystray not available")
         return None
     try:
-        ico = _res("res/icons/monitor-icon-17865/icon.ico")
+        ico = _res("ico/growny_app_icon.ico")
         try:
             im = Image.open(ico).convert("RGBA")
         except Exception:
             im = Image.new("RGBA", (64, 64), (30, 144, 255, 255))
         menu = Menu(
+            MenuItem("로그 확인", _open_log_viewer),
+            Menu.SEPARATOR,
             MenuItem("즉시 갱신", _on_refresh),
             MenuItem(lambda item: "재시작" if _paused else "일시 중지", _on_pause),
             Menu.SEPARATOR,
+            MenuItem("Windows 시작 시 자동실행",
+                     _on_toggle_startup,
+                     checked=lambda item: is_startup_registered()),
+            Menu.SEPARATOR,
             MenuItem("Exit", _on_exit),
         )
-        icon = pystray.Icon("turzx_cal", im, "Turzx Smart Calendar", menu)
+        icon = pystray.Icon("growny_mindblower", im, "Growny Mindblower", menu)
         threading.Thread(target=icon.run, daemon=True).start()
-        print("[Tray] System tray icon started")
+        _log("[Tray] System tray icon started")
         return icon
     except Exception as e:
-        print(f"[Tray] Failed to start: {e}")
+        _log(f"[Tray] Failed to start: {e}")
         return None
 
 # ─── Windows Startup ──────────────────────────────────────────────────────
+
+_STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_REG_NAME = "GrownyMindblower"
+
+def is_startup_registered():
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY, 0, winreg.KEY_READ)
+        winreg.QueryValueEx(key, _STARTUP_REG_NAME)
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
 
 def register_startup():
     if os.name != "nt":
         return
     try:
         import winreg
-        exe = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0])
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            0, winreg.KEY_SET_VALUE,
-        )
-        winreg.SetValueEx(key, "TurzxSmartCalendar", 0, winreg.REG_SZ, f'"{exe}"')
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+        else:
+            _log("[Startup] Skipped — EXE가 아닌 환경에서는 등록하지 않습니다")
+            return
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, f'"{exe}"')
         winreg.CloseKey(key)
+        _log("[Startup] Registered")
     except Exception:
         pass
+
+def unregister_startup():
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE)
+        winreg.DeleteValue(key, _STARTUP_REG_NAME)
+        winreg.CloseKey(key)
+        _log("[Startup] Unregistered")
+    except Exception:
+        pass
+
+def _on_toggle_startup(icon, item):
+    if is_startup_registered():
+        unregister_startup()
+    else:
+        register_startup()
 
 # ─── Display Init ─────────────────────────────────────────────────────────
 
@@ -1165,11 +1259,11 @@ def open_display(retries=3):
             scr.InitializeComm()
             return scr
         except Exception as e:
-            print(f"[Display] Attempt {attempt+1}/{retries}: {e}")
+            _log(f"[Display] Attempt {attempt+1}/{retries}: {e}")
             if attempt < retries - 1:
                 _kill_com_holders()
                 time.sleep(3)
-    print(f"[Display] Failed to open {COM_PORT}")
+    _log(f"[Display] Failed to open {COM_PORT}")
     return None
 
 # ─── Main ─────────────────────────────────────────────────────────────────
@@ -1177,7 +1271,7 @@ def open_display(retries=3):
 def main():
     global _force, _exit
 
-    print("[Turzx] Smart Calendar v2 booting...")
+    _log("[Turzx] Smart Calendar v2 booting...")
 
     tray = start_tray()
     register_startup()
@@ -1186,9 +1280,9 @@ def main():
     if screen:
         screen.SetOrientation(Orientation.PORTRAIT)
         screen.SetBrightness(100)
-        print(f"[Turzx] Display OK on {COM_PORT}")
+        _log(f"[Turzx] Display OK on {COM_PORT}")
     else:
-        print("[Turzx] No display - headless mode")
+        _log("[Turzx] No display - headless mode")
 
     # 영상 프리로드
     _load_video()
@@ -1204,7 +1298,7 @@ def main():
 
     has_video = len(_video_frames) > 0
 
-    print(f"[Turzx] Running. Display: {DISPLAY_REFRESH_SEC}s / API: {API_REFRESH_SEC}s / Email: {TOAST_CHECK_SEC}s / Video: {has_video}")
+    _log(f"[Turzx] Running. Display: {DISPLAY_REFRESH_SEC}s / API: {API_REFRESH_SEC}s / Email: {TOAST_CHECK_SEC}s / Video: {has_video}")
 
     # ── API를 백그라운드 스레드로 분리 (영상 루프 블로킹 방지) ──
     last_weather = 0
@@ -1239,7 +1333,7 @@ def main():
 
                 if now - last_email >= TOAST_CHECK_SEC:
                     emails = fetch_emails()
-                    print(f"[Gmail] fetched {len(emails)} unread, toast phase={toast.phase}")
+                    _log(f"[Gmail] fetched {len(emails)} unread, toast phase={toast.phase}")
                     toast.update(emails)
                     last_email = time.time()
                     if emails:
@@ -1247,7 +1341,7 @@ def main():
 
                 time.sleep(2)
             except Exception as e:
-                print(f"[API] {e}")
+                _log(f"[API] {e}")
                 time.sleep(10)
 
     api_thread = threading.Thread(target=_api_worker, daemon=True)
@@ -1264,13 +1358,13 @@ def main():
                 vf = render_header(weather, air)
                 init_img.paste(vf, (0, 0))
             screen.DisplayPILImage(init_img)  # 풀스크린 (초기화용, 1회만)
-            print("[Turzx] Initial full-screen sent (protocol init)")
+            _log("[Turzx] Initial full-screen sent (protocol init)")
             time.sleep(1)
             # Count.Start 리셋 — 이후 partial이 0부터 시작하도록
             from library.lcd.lcd_comm_rev_c import Count
             Count.Start = 0
         except Exception as e:
-            print(f"[Turzx] Init display: {e}")
+            _log(f"[Turzx] Init display: {e}")
 
     _toast_was_active = False
 
@@ -1297,7 +1391,7 @@ def main():
                         screen.DisplayPILImage(body_image, x=0, y=HEADER_H)
                         time.sleep(0.3)
                     except Exception as e:
-                        print(f"[Display] body: {e}")
+                        _log(f"[Display] body: {e}")
                     _body_dirty = False
                     last_body = time.time()
 
@@ -1308,7 +1402,7 @@ def main():
                 try:
                     screen.DisplayPILImage(header_img, x=0, y=0)
                 except Exception as e:
-                    print(f"[Display] header: {e}")
+                    _log(f"[Display] header: {e}")
 
             else:
                 # ── 정적 모드: partial update로 분할 전송 ──
@@ -1321,13 +1415,13 @@ def main():
                         body = image.crop((0, HEADER_H, SCREEN_WIDTH, SCREEN_HEIGHT))
                         screen.DisplayPILImage(body, x=0, y=HEADER_H)
                     except Exception as e:
-                        print(f"[Display] {e}")
+                        _log(f"[Display] {e}")
                 time.sleep(2 if toast.animating else DISPLAY_REFRESH_SEC)
 
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"[Turzx] {e}")
+            _log(f"[Turzx] {e}")
             time.sleep(5)
 
     if screen:
@@ -1335,7 +1429,7 @@ def main():
             screen.SetBrightness(0)
         except Exception:
             pass
-    print("[Turzx] Exited.")
+    _log("[Turzx] Exited.")
 
 def preview():
     """React dev server style - 브라우저에서 실시간 프리뷰."""
@@ -1343,8 +1437,8 @@ def preview():
     import io
 
     port = 8880
-    print(f"[Preview] http://localhost:{port} 에서 미리보기")
-    print("[Preview] 10초마다 자동 새로고침. Ctrl+C로 종료.")
+    _log(f"[Preview] http://localhost:{port} 에서 미리보기")
+    _log("[Preview] 10초마다 자동 새로고침. Ctrl+C로 종료.")
 
     toast = ToastManager()
     state = {"weather": None, "air": None, "allday": [], "timed": [],
