@@ -94,10 +94,7 @@ class LcdComm(ABC):
             if not self.com_port:
                 logger.error(
                     "Cannot find COM port automatically, please run Configuration again and select COM port manually")
-                try:
-                    sys.exit(0)
-                except:
-                    os._exit(0)
+                raise serial.SerialException("COM port auto-detect failed")
             else:
                 logger.debug(f"Auto detected COM port: {self.com_port}")
         else:
@@ -107,10 +104,7 @@ class LcdComm(ABC):
             self.lcd_serial = serial.Serial(self.com_port, 115200, timeout=1, rtscts=True)
         except Exception as e:
             logger.error(f"Cannot open COM port {self.com_port}: {e}")
-            try:
-                sys.exit(0)
-            except:
-                os._exit(0)
+            raise serial.SerialException(f"Cannot open {self.com_port}: {e}")
 
     def closeSerial(self):
         if self.lcd_serial is not None:
@@ -159,8 +153,11 @@ class LcdComm(ABC):
                 "SerialException: Failed to send serial data to device. Closing and reopening COM port before retrying once.")
             self.closeSerial()
             time.sleep(1)
-            self.openSerial()
-            self.serial_write(line)
+            try:
+                self.openSerial()
+                self.serial_write(line)
+            except Exception:
+                raise serial.SerialException("Failed to reconnect serial for write")
 
     def ReadData(self, readSize: int):
         try:
@@ -176,8 +173,11 @@ class LcdComm(ABC):
                 "SerialException: Failed to read serial data from device. Closing and reopening COM port before retrying once.")
             self.closeSerial()
             time.sleep(1)
-            self.openSerial()
-            return self.serial_read(readSize)
+            try:
+                self.openSerial()
+                return self.serial_read(readSize)
+            except Exception:
+                raise serial.SerialException("Failed to reconnect serial for read")
 
     @staticmethod
     @abstractmethod

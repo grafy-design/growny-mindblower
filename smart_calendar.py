@@ -13,13 +13,18 @@ import requests
 import urllib.parse
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-# ─── In-memory log buffer ─────────────────────────────────────────────────
+# ─── In-memory log buffer + 파일 로깅 ────────────────────────────────────
 _log_buffer = io.StringIO()
 _log_lock = threading.Lock()
 _LOG_MAX = 5000  # 최대 줄 수
 
+# 파일 로그: 크래시 원인 추적용
+_LOG_DIR = os.path.join(os.path.expanduser("~"), "TurzxLogs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(_LOG_DIR, f"turzx_{datetime.datetime.now().strftime('%Y%m%d')}.log")
+
 def _log(msg):
-    """print 대체 — 콘솔 + 메모리 버퍼 동시 기록."""
+    """print 대체 — 콘솔 + 메모리 버퍼 + 파일 동시 기록."""
     line = f"{datetime.datetime.now().strftime('%H:%M:%S')} {msg}"
     print(line)
     with _log_lock:
@@ -31,6 +36,12 @@ def _log(msg):
             _log_buffer.seek(0)
             _log_buffer.truncate()
             _log_buffer.write("\n".join(lines) + "\n")
+        # 파일 기록
+        try:
+            with open(_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 def _open_log_viewer(icon=None, item=None):
     """로그를 임시파일에 쓰고 메모장으로 열기."""
@@ -807,9 +818,9 @@ def render(weather, air, allday, timed, toasts, toast_off):
     d = ImageDraw.Draw(img)
     _draw_header_text(img, d, weather, air)
 
-    # ── Zone C: All-Day Events (폰트 29, 픽셀 기반 truncation) ───────
+    # ── Zone C: All-Day Events (폰트 20, 픽셀 기반 truncation) ───────
     yp = HEADER_H + 8
-    ad_font = font(29, 600)
+    ad_font = font(20, 600)
     ad_max_w = SCREEN_WIDTH - 10 - 20 - 8  # 좌우 패딩 제외
 
     for i, ev in enumerate(allday[:ALLDAY_MAX]):
@@ -823,7 +834,7 @@ def render(weather, air, allday, timed, toasts, toast_off):
 
     if len(allday) > ALLDAY_MAX:
         d.text((18, yp + 2), f"+ {len(allday) - ALLDAY_MAX}개 더",
-               font=font(24), fill=C_GRAY_TEXT)
+               font=font(17), fill=C_GRAY_TEXT)
         yp += 32
 
     if allday:
@@ -836,8 +847,8 @@ def render(weather, air, allday, timed, toasts, toast_off):
     hh = (tl_bot - tl_top) / total_h
     EVT_GAP = 4
     EVT_BORDER_W = 1
-    EVT_TITLE_FONT = font(38, 600)
-    EVT_TIME_FONT = font(22)
+    EVT_TITLE_FONT = font(27, 600)
+    EVT_TIME_FONT = font(15)
     HOUR_LABEL_FONT = font(30, 700)  # Pretendard Bold
     HOUR_LABEL_W = 50                # 시간 레이블 영역 폭
     EVT_LEFT = HOUR_LABEL_W + 8     # 이벤트 시작 x
@@ -903,9 +914,9 @@ def render(weather, air, allday, timed, toasts, toast_off):
         text_w = ex2 - text_x - 6
         title = _clean_title(ev["summary"])
         block_h = y2 - y1
-        time_h = 28
+        time_h = 20
         title_area = block_h - time_h - 12
-        line_h = 44
+        line_h = 31
         max_lines = max(1, int(title_area / line_h))
         lines = _wrap_text(title, EVT_TITLE_FONT, text_w, max_lines)
 
@@ -972,32 +983,21 @@ def render(weather, air, allday, timed, toasts, toast_off):
                     radius=TRAD, fill=255)
                 img.paste(blurred, (cx1, cy1), mask)
 
-            # 글래스 레이어: fill + 스트로크 + 좌측 그라데이션 쉐도우
             overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
             od = ImageDraw.Draw(overlay)
-            # 반투명 배경 (알파 70 — 블러 충분히 비침)
             od.rounded_rectangle(
                 [(TX1, ty), (TX2, ty + TOAST_H)],
-                radius=TRAD, fill=(255, 255, 255, 70))
-            # 외곽 스트로크: 유리 느낌
+                radius=TRAD, fill=(0, 0, 0, 25))
             od.rounded_rectangle(
                 [(TX1, ty), (TX2, ty + TOAST_H)],
-                radius=TRAD, outline=(255, 255, 255, 160), width=2)
-            # 내부 하이라이트
+                radius=TRAD, fill=(255, 255, 255, 40))
+            od.rounded_rectangle(
+                [(TX1, ty), (TX2, ty + TOAST_H)],
+                radius=TRAD, outline=(0, 0, 0, 40), width=2)
             od.rounded_rectangle(
                 [(TX1 + 2, ty + 2), (TX2 - 2, ty + TOAST_H - 2)],
-                radius=TRAD - 2, outline=(255, 255, 255, 80), width=1)
+                radius=TRAD - 2, outline=(255, 255, 255, 120), width=1)
             img = Image.alpha_composite(img, overlay)
-
-            # 좌측 그라데이션 쉐도우 (흰 배경에서도 프레임 구분)
-            shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
-            for gx in range(20):
-                alpha = int(35 * (1 - gx / 20))  # 35→0 fade
-                sd = ImageDraw.Draw(shadow)
-                sd.line([(TX1 + gx, ty + TRAD), (TX1 + gx, ty + TOAST_H - TRAD)],
-                        fill=(0, 0, 0, alpha), width=1)
-            # 좌측 상하 코너 부분도 부드럽게
-            img = Image.alpha_composite(img, shadow)
 
             d = ImageDraw.Draw(img)
 
@@ -1070,23 +1070,17 @@ def render_toast_partial(body_cache, toasts, toast_off):
         od = ImageDraw.Draw(overlay)
         od.rounded_rectangle(
             [(TX1, ty), (TX2, ty + TOAST_H)],
-            radius=TRAD, fill=(255, 255, 255, 70))
+            radius=TRAD, fill=(0, 0, 0, 25))
         od.rounded_rectangle(
             [(TX1, ty), (TX2, ty + TOAST_H)],
-            radius=TRAD, outline=(255, 255, 255, 160), width=2)
+            radius=TRAD, fill=(255, 255, 255, 40))
+        od.rounded_rectangle(
+            [(TX1, ty), (TX2, ty + TOAST_H)],
+            radius=TRAD, outline=(0, 0, 0, 40), width=2)
         od.rounded_rectangle(
             [(TX1 + 2, ty + 2), (TX2 - 2, ty + TOAST_H - 2)],
-            radius=TRAD - 2, outline=(255, 255, 255, 80), width=1)
+            radius=TRAD - 2, outline=(255, 255, 255, 120), width=1)
         img = Image.alpha_composite(img, overlay)
-
-        # 좌측 그라데이션 쉐도우
-        shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        for gx in range(20):
-            alpha = int(35 * (1 - gx / 20))
-            sd = ImageDraw.Draw(shadow)
-            sd.line([(TX1 + gx, ty + TRAD), (TX1 + gx, ty + TOAST_H - TRAD)],
-                    fill=(0, 0, 0, alpha), width=1)
-        img = Image.alpha_composite(img, shadow)
 
         d = ImageDraw.Draw(img)
 
@@ -1247,6 +1241,23 @@ def _kill_com_holders():
     except Exception:
         pass
 
+def _try_reconnect(old_screen):
+    """시리얼 에러 시 재연결 시도. 실패하면 None 반환 (headless 전환)."""
+    _log("[Display] Serial error — reconnecting in 5s...")
+    try:
+        old_screen.closeSerial()
+    except Exception:
+        pass
+    time.sleep(5)
+    new_screen = open_display(retries=2)
+    if new_screen:
+        new_screen.SetOrientation(Orientation.PORTRAIT)
+        new_screen.SetBrightness(100)
+        _log("[Display] Reconnected OK")
+        return new_screen
+    _log("[Display] Reconnect failed — headless mode until next attempt")
+    return None
+
 def open_display(retries=3):
     if not HAS_DISPLAY:
         return None
@@ -1392,6 +1403,7 @@ def main():
                         time.sleep(0.3)
                     except Exception as e:
                         _log(f"[Display] body: {e}")
+                        screen = _try_reconnect(screen)
                     _body_dirty = False
                     last_body = time.time()
 
@@ -1403,6 +1415,7 @@ def main():
                     screen.DisplayPILImage(header_img, x=0, y=0)
                 except Exception as e:
                     _log(f"[Display] header: {e}")
+                    screen = _try_reconnect(screen)
 
             else:
                 # ── 정적 모드: partial update로 분할 전송 ──
@@ -1416,6 +1429,7 @@ def main():
                         screen.DisplayPILImage(body, x=0, y=HEADER_H)
                     except Exception as e:
                         _log(f"[Display] {e}")
+                        screen = _try_reconnect(screen)
                 time.sleep(2 if toast.animating else DISPLAY_REFRESH_SEC)
 
         except KeyboardInterrupt:
