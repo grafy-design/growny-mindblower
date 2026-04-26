@@ -818,9 +818,9 @@ def render(weather, air, allday, timed, toasts, toast_off):
     d = ImageDraw.Draw(img)
     _draw_header_text(img, d, weather, air)
 
-    # ── Zone C: All-Day Events (폰트 20, 픽셀 기반 truncation) ───────
+    # ── Zone C: All-Day Events (폰트 24, 픽셀 기반 truncation) ───────
     yp = HEADER_H + 8
-    ad_font = font(20, 600)
+    ad_font = font(24, 600)
     ad_max_w = SCREEN_WIDTH - 10 - 20 - 8  # 좌우 패딩 제외
 
     for i, ev in enumerate(allday[:ALLDAY_MAX]):
@@ -834,7 +834,7 @@ def render(weather, air, allday, timed, toasts, toast_off):
 
     if len(allday) > ALLDAY_MAX:
         d.text((18, yp + 2), f"+ {len(allday) - ALLDAY_MAX}개 더",
-               font=font(17), fill=C_GRAY_TEXT)
+               font=font(20), fill=C_GRAY_TEXT)
         yp += 32
 
     if allday:
@@ -847,8 +847,8 @@ def render(weather, air, allday, timed, toasts, toast_off):
     hh = (tl_bot - tl_top) / total_h
     EVT_GAP = 4
     EVT_BORDER_W = 1
-    EVT_TITLE_FONT = font(27, 600)
-    EVT_TIME_FONT = font(15)
+    EVT_TITLE_FONT = font(32, 600)
+    EVT_TIME_FONT = font(18)
     HOUR_LABEL_FONT = font(30, 700)  # Pretendard Bold
     HOUR_LABEL_W = 50                # 시간 레이블 영역 폭
     EVT_LEFT = HOUR_LABEL_W + 8     # 이벤트 시작 x
@@ -914,9 +914,9 @@ def render(weather, air, allday, timed, toasts, toast_off):
         text_w = ex2 - text_x - 6
         title = _clean_title(ev["summary"])
         block_h = y2 - y1
-        time_h = 20
+        time_h = 24
         title_area = block_h - time_h - 12
-        line_h = 31
+        line_h = 37
         max_lines = max(1, int(title_area / line_h))
         lines = _wrap_text(title, EVT_TITLE_FONT, text_w, max_lines)
 
