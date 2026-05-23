@@ -83,7 +83,10 @@ except ImportError:
 
 SCREEN_WIDTH = 480
 SCREEN_HEIGHT = 1920
-COM_PORT = "COM4"
+COM_PORT = "COM4"  # 폴백 기본값. 실제로는 VID/PID 자동 탐지 우선 (_detect_display_port)
+# Turzx 8.8" 디스플레이 깨어있는 상태 식별자 (ELMO GMAS)
+DISPLAY_VID = 0x0525
+DISPLAY_PID = 0xA4A7
 
 MATON_API_KEY = "6_uOrU5mwMx-uvZz59I8edXVXKuc25TSQpx1Z3w67U8UFiCyFJqARsPy0vCI268hC4fpmrJ220gfWf_JkVHhz0hDHEMGdeSiJH4"
 GOV_API_KEY = "5592185f8b6d321587141f665d2b110c2a1a97eff2f504173ccb37267d4472e4"
@@ -1219,24 +1222,20 @@ def _kill_com_holders():
         return
     import subprocess
     my_pid = os.getpid()
-    # Kill other SmartCalendar instances (exclude self)
-    for name in ["SmartCalendar.exe", "smart_calendar.exe"]:
-        try:
-            subprocess.run(
-                ["powershell", "-Command",
-                 f"Get-Process -Name '{name.replace('.exe','')}' -ErrorAction SilentlyContinue | "
-                 f"Where-Object {{$_.Id -ne {my_pid}}} | Stop-Process -Force"],
-                capture_output=True, timeout=5,
-            )
-        except Exception:
-            pass
-    # Also kill any python process holding COM4 via serial
+    # 콘솔 창이 깜빡이지 않도록 숨김 플래그
+    CREATE_NO_WINDOW = 0x08000000
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    # 이전 인스턴스 + python 프로세스를 한 번에 종료 (자기 자신 제외)
+    names = "GrownyMindblower,SmartCalendar,smart_calendar,pythonw,python"
     try:
         subprocess.run(
-            ["powershell", "-Command",
-             f"Get-Process python* -ErrorAction SilentlyContinue | "
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+             f"Get-Process {names} -ErrorAction SilentlyContinue | "
              f"Where-Object {{$_.Id -ne {my_pid}}} | Stop-Process -Force"],
             capture_output=True, timeout=5,
+            creationflags=CREATE_NO_WINDOW, startupinfo=si,
         )
     except Exception:
         pass
@@ -1258,6 +1257,18 @@ def _try_reconnect(old_screen):
     _log("[Display] Reconnect failed — headless mode until next attempt")
     return None
 
+def _detect_display_port():
+    """ELMO GMAS 디스플레이를 VID/PID로 자동 탐지. COM 번호가 바뀌어도 찾는다.
+    탐지 실패 시 None 반환 → 호출부에서 폴백 후보 사용."""
+    try:
+        from serial.tools.list_ports import comports
+    except Exception:
+        return None
+    for p in comports():
+        if p.vid == DISPLAY_VID and p.pid == DISPLAY_PID:
+            return p.device
+    return None
+
 def open_display(retries=3):
     if not HAS_DISPLAY:
         return None
@@ -1265,16 +1276,26 @@ def open_display(retries=3):
     _kill_com_holders()
     time.sleep(2)
     for attempt in range(retries):
+        # 매 시도마다 현재 시점의 포트를 새로 탐지 (절전/재연결로 번호가 바뀔 수 있음)
+        port = _detect_display_port()
+        if port:
+            _log(f"[Display] Auto-detected ELMO GMAS on {port}")
+        else:
+            # 폴백: 흔한 후보 포트들을 순서대로 시도
+            candidates = [COM_PORT, "COM5", "COM6", "COM3", "COM7"]
+            port = candidates[attempt % len(candidates)]
+            _log(f"[Display] Auto-detect failed, trying fallback {port}")
         try:
-            scr = LcdCommRevC(com_port=COM_PORT, display_width=480, display_height=1920)
+            scr = LcdCommRevC(com_port=port, display_width=480, display_height=1920)
             scr.InitializeComm()
+            globals()["COM_PORT"] = port  # 성공한 포트 기억 (로깅/재연결용)
             return scr
         except Exception as e:
-            _log(f"[Display] Attempt {attempt+1}/{retries}: {e}")
+            _log(f"[Display] Attempt {attempt+1}/{retries} ({port}): {e}")
             if attempt < retries - 1:
                 _kill_com_holders()
                 time.sleep(3)
-    _log(f"[Display] Failed to open {COM_PORT}")
+    _log("[Display] Failed to open display on any port")
     return None
 
 # ─── Main ─────────────────────────────────────────────────────────────────
